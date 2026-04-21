@@ -1,8 +1,8 @@
 <div align="center">
 
-# BTC Profit Bot
+# Crypto Profit Bot
 
-**A lightweight Telegram bot that tracks profit and loss on a fixed Bitcoin hold and delivers scheduled price updates straight to your chat.**
+**A lightweight Telegram bot that tracks profit and loss on a fixed USD hold across 20 of the most popular cryptocurrencies, with scheduled updates delivered straight to your chat.**
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![python-telegram-bot](https://img.shields.io/badge/python--telegram--bot-21.6-26A5E4?logo=telegram&logoColor=white)](https://python-telegram-bot.org/)
@@ -18,6 +18,7 @@
 
 - [Overview](#overview)
 - [Features](#features)
+- [Supported Coins](#supported-coins)
 - [How It Works](#how-it-works)
 - [Commands](#commands)
 - [Prerequisites](#prerequisites)
@@ -35,42 +36,60 @@
 
 ## Overview
 
-**BTC Profit Bot** is a minimal, self-hosted Telegram bot written in Python. Given a fixed USD hold and a user-defined entry price, it calculates live unrealised profit or loss against the current Bitcoin spot price and delivers updates on a schedule the user controls.
+**Crypto Profit Bot** is a minimal, self-hosted Telegram bot written in Python. Given a fixed USD hold per coin and a user-defined entry price, it calculates live unrealised profit or loss across a personalised portfolio of cryptocurrencies and delivers combined updates on a schedule the user controls.
 
-It is designed for personal use — a private side-project companion for anyone who wants passive visibility into a small BTC position without opening an exchange app.
+It is designed for personal use — a private side-project companion for anyone who wants passive visibility into small crypto positions without opening an exchange app.
 
 ## Features
 
-- 📈 **Live P&L tracking** against a user-defined entry price
-- ⏱️ **Configurable update interval** (every _n_ minutes, set via chat command)
+- 🪙 **Track up to 20 popular coins** with tap-to-select inline keyboards
+- 📈 **Per-coin P&L** plus a combined portfolio total in every update
+- ⏱️ **Configurable update interval** set via chat command
 - 💬 **On-demand status checks** with `/status`
-- 🪙 **No API key required** — uses the public [CoinGecko](https://www.coingecko.com/en/api) endpoint
+- 🔓 **No API key required** — uses the public [CoinGecko](https://www.coingecko.com/en/api) endpoint
 - 🔐 **Token kept in environment variables**, never hardcoded in source
 - ☁️ **Deploy-ready** for Railway, Render, Fly.io, or any VPS
-- 🪶 **Single-file implementation** — ~200 lines, easy to audit and extend
+- 🪶 **Single-file implementation** — easy to audit and extend
+
+## Supported Coins
+
+| Symbol | Name          | Symbol | Name          |
+| ------ | ------------- | ------ | ------------- |
+| BTC    | Bitcoin       | SHIB   | Shiba Inu     |
+| ETH    | Ethereum      | TRX    | TRON          |
+| SOL    | Solana        | LTC    | Litecoin      |
+| BNB    | BNB           | BCH    | Bitcoin Cash  |
+| XRP    | XRP           | NEAR   | NEAR Protocol |
+| DOGE   | Dogecoin      | ATOM   | Cosmos        |
+| ADA    | Cardano       | TON    | Toncoin       |
+| AVAX   | Avalanche     | APT    | Aptos         |
+| LINK   | Chainlink     | ARB    | Arbitrum      |
+| DOT    | Polkadot      | POL    | Polygon       |
 
 ## How It Works
 
-The bot treats the hold as a fixed USD amount (default: `$10.00`) converted to BTC at the user's declared entry price, then values that BTC at the current market price:
+For each tracked coin, the bot treats the hold as a fixed USD amount (default: `$10.00`) converted to that coin at the user's declared entry price, then values it at the current market price:
 
 ```
-btc_amount    = hold_usd / entry_price
-current_value = btc_amount × current_price
+coin_amount   = hold_usd / entry_price
+current_value = coin_amount × current_price
 profit        = current_value − hold_usd
 pct_change    = profit / hold_usd × 100
 ```
 
-Prices are polled from CoinGecko's public `simple/price` endpoint. Scheduling is handled by [`python-telegram-bot`](https://python-telegram-bot.org/)'s built-in `JobQueue`, which runs the update job per chat on the interval the user sets.
+Prices are polled from CoinGecko's public `simple/price` endpoint in a single batched request per update. Scheduling is handled by [`python-telegram-bot`](https://python-telegram-bot.org/)'s built-in `JobQueue`, which runs the update job per chat on the interval the user sets.
 
 ## Commands
 
-| Command                 | Description                                              | Example               |
-| ----------------------- | -------------------------------------------------------- | --------------------- |
-| `/start`                | Display the welcome message and command reference        | `/start`              |
-| `/setentry <price>`     | Set the BTC entry price in USD                           | `/setentry 65000`     |
-| `/setinterval <min>`    | Start (or restart) scheduled updates every _n_ minutes   | `/setinterval 15`     |
-| `/status`               | Fetch the current profit/loss on demand                  | `/status`             |
-| `/stop`                 | Cancel scheduled updates for the current chat            | `/stop`               |
+| Command                          | Description                                              | Example                |
+| -------------------------------- | -------------------------------------------------------- | ---------------------- |
+| `/start`                         | Display the welcome message and command reference        | `/start`               |
+| `/coins`                         | Tap-to-select which coins to track                       | `/coins`               |
+| `/setentry <SYMBOL> <price>`     | Set the entry price in USD for a coin                    | `/setentry BTC 65000`  |
+| `/setinterval <min>`             | Start (or restart) scheduled updates every _n_ minutes   | `/setinterval 15`      |
+| `/status`                        | Fetch the combined profit/loss on demand                 | `/status`              |
+| `/portfolio`                     | Show tracked coins and their entry prices                | `/portfolio`           |
+| `/stop`                          | Cancel scheduled updates for the current chat            | `/stop`                |
 
 ## Prerequisites
 
@@ -96,8 +115,6 @@ pip install -r requirements.txt
 
 ### 3. Run locally
 
-Set the bot token as an environment variable and start the bot:
-
 **macOS / Linux**
 ```bash
 export TELEGRAM_BOT_TOKEN="your_token_here"
@@ -122,25 +139,29 @@ Open the bot you created, then:
 
 ```
 /start
-/setentry 65000
-/setinterval 15
+/coins                    ← tap the coins you want to track
+/setentry BTC 65000       ← set entry price for each
+/setentry ETH 3500
+/setinterval 15           ← every 15 minutes
 /status
 ```
 
-You'll start receiving updates in the chat at the configured interval.
+You'll start receiving combined portfolio updates in the chat at the configured interval.
 
 ## Configuration
 
 | Setting             | Where               | Default    | Description                                           |
 | ------------------- | ------------------- | ---------- | ----------------------------------------------------- |
 | `TELEGRAM_BOT_TOKEN`| Environment var     | _required_ | Token from @BotFather                                 |
-| `HOLD_USD`          | `btc_profit_bot.py` | `10.0`     | Hold amount in USD used for all P&L calculations      |
+| `HOLD_USD`          | `btc_profit_bot.py` | `10.0`     | Hold amount (USD) per coin used in all P&L maths      |
 
 To change the hold amount, edit the constant near the top of `btc_profit_bot.py`:
 
 ```python
 HOLD_USD = 10.0  # change this
 ```
+
+Note that `HOLD_USD` applies per coin — tracking 3 coins with a $10 hold each is equivalent to a $30 total notional portfolio.
 
 ## Deployment
 
@@ -169,7 +190,8 @@ btc-profit-bot/
 ├── btc_profit_bot.py    # Main bot application
 ├── requirements.txt     # Python dependencies
 ├── README.md            # Project documentation
-└── LICENSE              # MIT License
+├── LICENSE              # MIT License
+└── .gitignore           # Files excluded from version control
 ```
 
 ## Troubleshooting
@@ -183,14 +205,17 @@ The token is missing, malformed, or has been revoked. A valid token has the form
 **Bot runs but doesn't respond in Telegram**
 You must send `/start` to the bot from your Telegram account at least once so it can reply to you. Telegram bots cannot initiate conversations.
 
-**Entry price forgotten after restart**
-State is held in memory for simplicity. Resend `/setentry` after a restart, or see the roadmap item on persistence below.
+**A coin shows "price unavailable"**
+CoinGecko may have briefly rate-limited the request, or the coin's ID changed upstream. The bot skips unavailable coins and continues with the rest; if it persists for a specific coin, open an issue.
+
+**Entry prices forgotten after restart**
+State is held in memory for simplicity. Resend `/setentry` for each coin after a restart, or see the roadmap item on persistence below.
 
 ## Roadmap
 
-- [ ] SQLite persistence for entry price and interval (survive restarts)
-- [ ] Threshold alerts (`/alert +5%` — notify only when P&L crosses a band)
-- [ ] Multi-asset support (ETH, SOL, configurable list)
+- [ ] SQLite persistence for tracked coins and entry prices (survive restarts)
+- [ ] Threshold alerts (`/alert BTC +5%` — notify only when P&L crosses a band)
+- [ ] Custom hold amount per coin (`/sethold BTC 50`)
 - [ ] `/history` command with a sparkline chart
 - [ ] Dockerfile and one-click deploy buttons
 

@@ -1,52 +1,58 @@
 """
-Crypto Profit Telegram Bot
---------------------------
-Track profit/loss on multiple popular coins with per-coin intervals.
+Crypto Profit Telegram Bot (multi-coin)
+---------------------------------------
+Tracks profit/loss on a fixed USD hold across multiple cryptocurrencies.
 
 Commands:
-  /start   - Show help
-  /coins   - Pick a coin to track (interactive buttons)
-  /status  - See all your tracked positions
-  /sethold - Set your USD hold amount
-  /stop    - Stop notifications
-  /cancel  - Cancel current operation
+  /start                        - Welcome & command reference
+  /coins                        - Tap-to-select which coins to track
+  /setentry <SYMBOL> <price>    - Set entry price for a coin (e.g. /setentry BTC 65000)
+  /setinterval <minutes>        - Start scheduled updates
+  /status                       - Combined profit/loss snapshot right now
+  /portfolio                    - Show tracked coins and their entry prices
+  /stop                         - Stop scheduled updates
 """
 
 import os
-import time
 import logging
 import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
-    ContextTypes,
-    ConversationHandler,
     CallbackQueryHandler,
-    MessageHandler,
-    filters,
+    ContextTypes,
 )
 
 # ---------- Config ----------
-COINS = {
-    "BTC":  {"name": "Bitcoin",   "emoji": "₿",  "binance": "BTCUSDT"},
-    "ETH":  {"name": "Ethereum",  "emoji": "Ξ",  "binance": "ETHUSDT"},
-    "SOL":  {"name": "Solana",    "emoji": "◎",  "binance": "SOLUSDT"},
-    "BNB":  {"name": "BNB",       "emoji": "🟡", "binance": "BNBUSDT"},
-    "XRP":  {"name": "XRP",       "emoji": "💧", "binance": "XRPUSDT"},
-    "DOGE": {"name": "Dogecoin",  "emoji": "🐕", "binance": "DOGEUSDT"},
-    "ADA":  {"name": "Cardano",   "emoji": "🔵", "binance": "ADAUSDT"},
-    "AVAX": {"name": "Avalanche", "emoji": "🔺", "binance": "AVAXUSDT"},
-    "SHIB": {"name": "Shiba Inu", "emoji": "🐶", "binance": "SHIBUSDT"},
-    "PEPE": {"name": "Pepe",      "emoji": "🐸", "binance": "PEPEUSDT"},
-    "WIF":  {"name": "dogwifhat", "emoji": "🎩", "binance": "WIFUSDT"},
-    "BONK": {"name": "Bonk",      "emoji": "🔨", "binance": "BONKUSDT"},
-    "SUI":  {"name": "Sui",       "emoji": "💎", "binance": "SUIUSDT"},
-    "TON":  {"name": "Toncoin",   "emoji": "💎", "binance": "TONUSDT"},
+HOLD_USD = 10.0  # Hold balance per coin (USD)
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+
+# Curated list of popular coins: {symbol: (coingecko_id, display_name)}
+SUPPORTED_COINS = {
+    "BTC":   ("bitcoin",          "Bitcoin"),
+    "ETH":   ("ethereum",         "Ethereum"),
+    "SOL":   ("solana",           "Solana"),
+    "BNB":   ("binancecoin",      "BNB"),
+    "XRP":   ("ripple",           "XRP"),
+    "DOGE":  ("dogecoin",         "Dogecoin"),
+    "ADA":   ("cardano",          "Cardano"),
+    "AVAX":  ("avalanche-2",      "Avalanche"),
+    "LINK":  ("chainlink",        "Chainlink"),
+    "DOT":   ("polkadot",         "Polkadot"),
+    "POL":   ("polygon-ecosystem-token", "Polygon"),
+    "SHIB":  ("shiba-inu",        "Shiba Inu"),
+    "TRX":   ("tron",             "TRON"),
+    "LTC":   ("litecoin",         "Litecoin"),
+    "BCH":   ("bitcoin-cash",     "Bitcoin Cash"),
+    "NEAR":  ("near",             "NEAR Protocol"),
+    "ATOM":  ("cosmos",           "Cosmos"),
+    "TON":   ("the-open-network", "Toncoin"),
+    "APT":   ("aptos",            "Aptos"),
+    "ARB":   ("arbitrum",         "Arbitrum"),
 }
-DEFAULT_HOLD_USD = 10.0
-BINANCE_URL = "https://api.binance.com/api/v3/ticker/price"
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "PUT_YOUR_TOKEN_HERE")
+
+COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price"
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -54,378 +60,312 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ConversationHandler states
-CHOOSING_COIN, ENTERING_PRICE, CHOOSING_INTERVAL = range(3)
-SETHOLD_MENU, ENTERING_CUSTOM_HOLD = range(3, 5)
 
-
-# ---------- Helpers ----------
-_price_cache: dict[str, tuple[float, float]] = {}  # symbol → (price, timestamp)
-
-
-async def get_coin_price(symbol: str) -> float:
-    cached = _price_cache.get(symbol)
-    if cached and time.time() - cached[1] < 60:
-        return cached[0]
+# ---------- Price fetching ----------
+async def get_prices(symbols: list) -> dict:
+    """Fetch current USD prices for the given symbols. Returns {SYMBOL: price}."""
+    if not symbols:
+        return {}
+    ids = [SUPPORTED_COINS[s][0] for s in symbols if s in SUPPORTED_COINS]
+    params = {"ids": ",".join(ids), "vs_currencies": "usd"}
     async with httpx.AsyncClient(timeout=10.0) as client:
-        r = await client.get(BINANCE_URL, params={"symbol": COINS[symbol]["binance"]})
+        r = await client.get(COINGECKO_URL, params=params)
         r.raise_for_status()
-        price = float(r.json()["price"])
-    _price_cache[symbol] = (price, time.time())
-    return price
+        data = r.json()
+
+    result = {}
+    for symbol in symbols:
+        coin_id = SUPPORTED_COINS[symbol][0]
+        if coin_id in data and "usd" in data[coin_id]:
+            result[symbol] = float(data[coin_id]["usd"])
+    return result
 
 
-def format_status(symbol: str, entry_price: float, current_price: float, hold_usd: float) -> str:
-    coin = COINS[symbol]
-    amount = hold_usd / entry_price
-    current_value = amount * current_price
-    profit = current_value - hold_usd
-    pct = (profit / hold_usd) * 100
-    emoji = "🟢" if profit >= 0 else "🔴"
-    sign = "+" if profit >= 0 else ""
-    return (
-        f"{emoji} *{coin['emoji']} {coin['name']} ({symbol})*\n"
-        f"Entry: `${entry_price:,.4f}` | Now: `${current_price:,.4f}`\n"
-        f"Hold: `${hold_usd:.2f}` → `${current_value:.4f}`\n"
-        f"P/L: *{sign}${profit:,.4f}* ({sign}{pct:.2f}%)"
-    )
+# ---------- Formatting ----------
+def format_status(tracked, entries, prices) -> str:
+    """Build the combined status message across all tracked coins."""
+    lines = ["*📊 Portfolio Update*\n"]
+    total_profit = 0.0
+    total_hold = 0.0
+    valid_rows = 0
 
+    for symbol in sorted(tracked):
+        if symbol not in prices:
+            lines.append(f"⚠️ *{symbol}* — price unavailable")
+            continue
+        entry = entries.get(symbol)
+        current = prices[symbol]
 
-def coin_keyboard() -> InlineKeyboardMarkup:
-    symbols = list(COINS.keys())
-    rows = []
-    for i in range(0, len(symbols), 2):
-        row = [
-            InlineKeyboardButton(
-                f"{COINS[sym]['emoji']} {sym}",
-                callback_data=f"coin_{sym}",
+        if entry is None:
+            lines.append(
+                f"• *{symbol}* `${current:,.4f}`  _(no entry — /setentry {symbol} <price>)_"
             )
-            for sym in symbols[i:i + 2]
-        ]
-        rows.append(row)
-    return InlineKeyboardMarkup(rows)
+            continue
+
+        coin_amount = HOLD_USD / entry
+        current_value = coin_amount * current
+        profit = current_value - HOLD_USD
+        pct = (profit / HOLD_USD) * 100
+        emoji = "🟢" if profit >= 0 else "🔴"
+        sign = "+" if profit >= 0 else ""
+        total_profit += profit
+        total_hold += HOLD_USD
+        valid_rows += 1
+
+        lines.append(
+            f"{emoji} *{symbol}*  `${current:,.4f}`\n"
+            f"    entry `${entry:,.4f}` → P/L *{sign}${profit:,.4f}* ({sign}{pct:.2f}%)"
+        )
+
+    if valid_rows > 1:
+        total_pct = (total_profit / total_hold) * 100 if total_hold else 0
+        sign = "+" if total_profit >= 0 else ""
+        lines.append(
+            f"\n*Total* across {valid_rows} coins: "
+            f"*{sign}${total_profit:,.4f}* ({sign}{total_pct:.2f}%)"
+        )
+
+    return "\n".join(lines)
 
 
-def interval_keyboard() -> InlineKeyboardMarkup:
-    options = [("1 min", 1), ("5 min", 5), ("15 min", 15), ("30 min", 30), ("1 hour", 60)]
-    rows = []
-    for i in range(0, len(options), 2):
-        row = [
-            InlineKeyboardButton(label, callback_data=f"interval_{mins}")
-            for label, mins in options[i:i + 2]
-        ]
-        rows.append(row)
-    return InlineKeyboardMarkup(rows)
+# ---------- Keyboard ----------
+def build_coins_keyboard(selected) -> InlineKeyboardMarkup:
+    """Build 2-column inline keyboard of coins with checkmarks on selected ones."""
+    buttons = []
+    symbols = list(SUPPORTED_COINS.keys())
+    for i in range(0, len(symbols), 2):
+        row = []
+        for symbol in symbols[i:i + 2]:
+            mark = "✅" if symbol in selected else "⬜"
+            row.append(InlineKeyboardButton(
+                f"{mark} {symbol}", callback_data=f"toggle:{symbol}"
+            ))
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("Done ✓", callback_data="done")])
+    return InlineKeyboardMarkup(buttons)
 
 
-def hold_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("$10", callback_data="hold_10"),
-            InlineKeyboardButton("$50", callback_data="hold_50"),
-            InlineKeyboardButton("$100", callback_data="hold_100"),
-        ],
-        [
-            InlineKeyboardButton("$500", callback_data="hold_500"),
-            InlineKeyboardButton("✏️ Custom", callback_data="hold_custom"),
-        ],
-    ])
-
-
-def cancel_coin_job(context: ContextTypes.DEFAULT_TYPE, chat_id: int, symbol: str) -> None:
-    for job in context.job_queue.get_jobs_by_name(f"{chat_id}_{symbol}"):
-        job.schedule_removal()
-
-
-# ---------- /start ----------
+# ---------- Command handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "👋 *Crypto Profit Bot*\n\n"
-        "Track your P/L across multiple coins with automatic updates.\n\n"
-        "• /coins — Pick a coin to track\n"
-        "• /status — See all your positions\n"
-        "• /sethold — Set your USD hold amount\n"
-        "• /stop — Stop notifications\n"
-        "• /cancel — Cancel current operation",
+        "Track P/L on a $10 hold per coin across the top cryptocurrencies.\n\n"
+        "*Get started:*\n"
+        "1. /coins — pick coins to track\n"
+        "2. `/setentry BTC 65000` — set entry price for each\n"
+        "3. `/setinterval 15` — start scheduled updates\n"
+        "4. /status — check anytime\n\n"
+        "*Other:*\n"
+        "• /portfolio — review your tracked coins\n"
+        "• /stop — cancel scheduled updates",
         parse_mode="Markdown",
     )
 
 
-# ---------- /coins ConversationHandler ----------
-async def coins_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def coins(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    selected = context.chat_data.setdefault("tracked", set())
     await update.message.reply_text(
-        "📊 *Pick a coin to track:*",
-        reply_markup=coin_keyboard(),
+        "Tap to toggle coins. Press *Done* when finished.",
+        reply_markup=build_coins_keyboard(selected),
         parse_mode="Markdown",
     )
-    return CHOOSING_COIN
 
 
-async def coin_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def on_coin_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    symbol = query.data.split("_", 1)[1]
-    context.chat_data["pending_coin"] = symbol
-    coin = COINS[symbol]
-    await query.edit_message_text(
-        f"💰 Enter your *{coin['emoji']} {symbol}* entry price in USD:",
-        parse_mode="Markdown",
-    )
-    return ENTERING_PRICE
+    data = query.data
+    selected = context.chat_data.setdefault("tracked", set())
+
+    if data == "done":
+        if not selected:
+            await query.edit_message_text("No coins selected. Send /coins to try again.")
+            return
+        coin_list = ", ".join(sorted(selected))
+        await query.edit_message_text(
+            f"✅ Tracking: *{coin_list}*\n\n"
+            f"Next: set an entry price for each, e.g. `/setentry BTC 65000`",
+            parse_mode="Markdown",
+        )
+        return
+
+    if data.startswith("toggle:"):
+        symbol = data.split(":", 1)[1]
+        if symbol in selected:
+            selected.remove(symbol)
+        else:
+            selected.add(symbol)
+        await query.edit_message_reply_markup(
+            reply_markup=build_coins_keyboard(selected)
+        )
 
 
-async def price_entered(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def set_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if len(context.args) != 2:
+        await update.message.reply_text(
+            "Usage: `/setentry SYMBOL PRICE`\nExample: `/setentry BTC 65000`",
+            parse_mode="Markdown",
+        )
+        return
+
+    symbol = context.args[0].upper()
+    if symbol not in SUPPORTED_COINS:
+        supported = ", ".join(SUPPORTED_COINS.keys())
+        await update.message.reply_text(
+            f"❌ `{symbol}` not supported.\n\nAvailable: {supported}",
+            parse_mode="Markdown",
+        )
+        return
+
     try:
-        price = float(update.message.text.replace(",", "").replace("$", ""))
+        price = float(context.args[1])
         if price <= 0:
             raise ValueError
     except ValueError:
-        await update.message.reply_text("❌ Invalid price. Please enter a positive number:")
-        return ENTERING_PRICE
+        await update.message.reply_text(
+            "❌ Invalid price. Example: `/setentry BTC 65000`",
+            parse_mode="Markdown",
+        )
+        return
 
-    context.chat_data["pending_price"] = price
-    symbol = context.chat_data["pending_coin"]
+    entries = context.chat_data.setdefault("entries", {})
+    entries[symbol] = price
+
+    # Auto-add to tracked list if not already there
+    tracked = context.chat_data.setdefault("tracked", set())
+    tracked.add(symbol)
+
     await update.message.reply_text(
-        f"⏱ How often should I send *{symbol}* updates?",
-        reply_markup=interval_keyboard(),
-        parse_mode="Markdown",
+        f"✅ {symbol} entry price set to ${price:,.4f}"
     )
-    return CHOOSING_INTERVAL
 
 
-async def interval_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
+async def portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    tracked = context.chat_data.get("tracked", set())
+    entries = context.chat_data.get("entries", {})
 
-    minutes = int(query.data.split("_", 1)[1])
-    symbol = context.chat_data.pop("pending_coin")
-    entry_price = context.chat_data.pop("pending_price")
-    coin = COINS[symbol]
-    chat_id = query.message.chat_id
-    hold_usd = context.chat_data.get("hold_usd", DEFAULT_HOLD_USD)
+    if not tracked:
+        await update.message.reply_text("No coins tracked yet. Send /coins to pick some.")
+        return
 
-    positions = context.chat_data.setdefault("positions", {})
-    positions[symbol] = {"entry_price": entry_price, "interval": minutes}
+    lines = ["*Your portfolio:*\n"]
+    for symbol in sorted(tracked):
+        entry = entries.get(symbol)
+        if entry is None:
+            lines.append(f"• *{symbol}* — no entry set")
+        else:
+            lines.append(f"• *{symbol}* — entry `${entry:,.4f}`")
 
-    cancel_coin_job(context, chat_id, symbol)
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def set_interval(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Usage: /setinterval 15  (minutes)")
+        return
+    try:
+        minutes = int(context.args[0])
+        if minutes < 1:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Interval must be an integer ≥ 1 (minutes).")
+        return
+
+    tracked = context.chat_data.get("tracked", set())
+    if not tracked:
+        await update.message.reply_text("⚠️ Pick coins first with /coins.")
+        return
+
+    chat_id = update.effective_chat.id
+
+    # Remove any existing job for this chat
+    for job in context.job_queue.get_jobs_by_name(str(chat_id)):
+        job.schedule_removal()
+
     context.job_queue.run_repeating(
         send_update,
         interval=minutes * 60,
         first=0,
         chat_id=chat_id,
-        name=f"{chat_id}_{symbol}",
-        data={"symbol": symbol, "entry_price": entry_price},
+        name=str(chat_id),
+        data={"chat_data_ref": context.chat_data},
     )
-
-    interval_label = f"{minutes} min" if minutes < 60 else "1 hour"
-    await query.edit_message_text(
-        f"✅ Tracking *{coin['emoji']} {symbol}* at `${entry_price:,.4f}`\n"
-        f"Updates every *{interval_label}* | Hold: *${hold_usd:.2f}*",
-        parse_mode="Markdown",
-    )
-    return ConversationHandler.END
+    await update.message.reply_text(f"✅ Updates every {minutes} minute(s).")
 
 
-# ---------- /sethold ConversationHandler ----------
-async def sethold_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    hold = context.chat_data.get("hold_usd", DEFAULT_HOLD_USD)
-    await update.message.reply_text(
-        f"💵 Current hold: *${hold:.2f}*\nChoose a new amount:",
-        reply_markup=hold_keyboard(),
-        parse_mode="Markdown",
-    )
-    return SETHOLD_MENU
-
-
-async def hold_preset_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    amount = float(query.data.split("_", 1)[1])
-    context.chat_data["hold_usd"] = amount
-    await query.edit_message_text(f"✅ Hold amount set to *${amount:.2f}*", parse_mode="Markdown")
-    return ConversationHandler.END
-
-
-async def hold_custom_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text("✏️ Enter your custom hold amount in USD:")
-    return ENTERING_CUSTOM_HOLD
-
-
-async def custom_hold_entered(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    try:
-        amount = float(update.message.text.replace(",", "").replace("$", ""))
-        if amount <= 0:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("❌ Invalid amount. Enter a positive number:")
-        return ENTERING_CUSTOM_HOLD
-    context.chat_data["hold_usd"] = amount
-    await update.message.reply_text(f"✅ Hold amount set to *${amount:.2f}*", parse_mode="Markdown")
-    return ConversationHandler.END
-
-
-# ---------- Shared cancel fallback ----------
-async def cancel_conv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.chat_data.pop("pending_coin", None)
-    context.chat_data.pop("pending_price", None)
-    await update.message.reply_text("❌ Cancelled.")
-    return ConversationHandler.END
-
-
-# ---------- /status ----------
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    positions = context.chat_data.get("positions", {})
-    if not positions:
-        await update.message.reply_text("No coins tracked yet. Use /coins to start.")
+    tracked = context.chat_data.get("tracked", set())
+    entries = context.chat_data.get("entries", {})
+
+    if not tracked:
+        await update.message.reply_text("No coins tracked. Send /coins to pick some.")
         return
 
-    hold_usd = context.chat_data.get("hold_usd", DEFAULT_HOLD_USD)
-    for symbol, pos in positions.items():
-        try:
-            price = await get_coin_price(symbol)
-        except Exception as e:
-            await update.message.reply_text(f"⚠️ Could not fetch {symbol} price: {e}")
-            continue
-        text = format_status(symbol, pos["entry_price"], price, hold_usd)
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton(f"❌ Untrack {symbol}", callback_data=f"untrack_{symbol}")
-        ]])
-        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
-
-
-# ---------- /stop ----------
-async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    positions = context.chat_data.get("positions", {})
-    if not positions:
-        await update.message.reply_text("No active notifications.")
+    try:
+        prices = await get_prices(list(tracked))
+    except Exception as e:
+        logger.exception("Price fetch failed")
+        await update.message.reply_text(f"⚠️ Could not fetch prices: {e}")
         return
 
-    buttons = [[InlineKeyboardButton("🛑 Stop All", callback_data="stop_all")]]
-    for symbol in positions:
-        coin = COINS[symbol]
-        buttons.append([
-            InlineKeyboardButton(f"Stop {coin['emoji']} {symbol}", callback_data=f"stop_{symbol}")
-        ])
     await update.message.reply_text(
-        "Which notifications would you like to stop?",
-        reply_markup=InlineKeyboardMarkup(buttons),
+        format_status(tracked, entries, prices), parse_mode="Markdown"
     )
 
 
-# ---------- Callback handlers ----------
-async def untrack_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    symbol = query.data.split("_", 1)[1]
-    positions = context.chat_data.get("positions", {})
-    if symbol not in positions:
-        await query.edit_message_text(f"{symbol} is not being tracked.")
+async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    jobs = context.job_queue.get_jobs_by_name(str(chat_id))
+    if not jobs:
+        await update.message.reply_text("No active updates to stop.")
         return
-    cancel_coin_job(context, query.message.chat_id, symbol)
-    del positions[symbol]
-    coin = COINS[symbol]
-    await query.edit_message_text(
-        f"✅ Stopped tracking *{coin['emoji']} {symbol}*", parse_mode="Markdown"
-    )
-
-
-async def stop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    chat_id = query.message.chat_id
-    positions = context.chat_data.get("positions", {})
-
-    if query.data == "stop_all":
-        for symbol in list(positions.keys()):
-            cancel_coin_job(context, chat_id, symbol)
-        positions.clear()
-        await query.edit_message_text("🛑 All notifications stopped.")
-    else:
-        symbol = query.data.split("_", 1)[1]
-        cancel_coin_job(context, chat_id, symbol)
-        positions.pop(symbol, None)
-        coin = COINS[symbol]
-        await query.edit_message_text(
-            f"🛑 Stopped *{coin['emoji']} {symbol}* notifications.", parse_mode="Markdown"
-        )
+    for job in jobs:
+        job.schedule_removal()
+    await update.message.reply_text("🛑 Auto-updates stopped.")
 
 
 # ---------- Scheduled job ----------
 async def send_update(context: ContextTypes.DEFAULT_TYPE) -> None:
     job = context.job
-    symbol = job.data["symbol"]
-    entry_price = job.data["entry_price"]
-    hold_usd = context.chat_data.get("hold_usd", DEFAULT_HOLD_USD)
+    chat_data = job.data["chat_data_ref"]
+    tracked = chat_data.get("tracked", set())
+    entries = chat_data.get("entries", {})
+
+    if not tracked:
+        return
+
     try:
-        price = await get_coin_price(symbol)
+        prices = await get_prices(list(tracked))
     except Exception as e:
-        logger.exception("Scheduled price fetch failed for %s", symbol)
+        logger.exception("Scheduled price fetch failed")
         await context.bot.send_message(
-            chat_id=job.chat_id, text=f"⚠️ Could not fetch {symbol} price: {e}"
+            chat_id=job.chat_id, text=f"⚠️ Price fetch failed: {e}"
         )
         return
+
     await context.bot.send_message(
         chat_id=job.chat_id,
-        text=format_status(symbol, entry_price, price, hold_usd),
+        text=format_status(tracked, entries, prices),
         parse_mode="Markdown",
     )
 
 
-# ---------- Error handler ----------
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.exception("Unhandled exception", exc_info=context.error)
-
-
 # ---------- Main ----------
 def main() -> None:
-    if BOT_TOKEN == "PUT_YOUR_TOKEN_HERE":
-        raise SystemExit("❌ Set TELEGRAM_BOT_TOKEN env var or edit BOT_TOKEN in the code.")
+    if not BOT_TOKEN:
+        raise SystemExit(
+            "❌ TELEGRAM_BOT_TOKEN environment variable is not set."
+        )
 
     app = Application.builder().token(BOT_TOKEN).build()
-
-    common_fallbacks = [
-        CommandHandler("cancel", cancel_conv),
-        CommandHandler("start", start),
-        CommandHandler("status", status),
-        CommandHandler("stop", stop_command),
-    ]
-
-    coins_conv = ConversationHandler(
-        entry_points=[CommandHandler("coins", coins_start)],
-        states={
-            CHOOSING_COIN: [CallbackQueryHandler(coin_chosen, pattern="^coin_")],
-            ENTERING_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, price_entered)],
-            CHOOSING_INTERVAL: [CallbackQueryHandler(interval_chosen, pattern="^interval_")],
-        },
-        fallbacks=common_fallbacks + [CommandHandler("sethold", sethold_start)],
-        allow_reentry=True,
-    )
-
-    hold_conv = ConversationHandler(
-        entry_points=[CommandHandler("sethold", sethold_start)],
-        states={
-            SETHOLD_MENU: [
-                CallbackQueryHandler(hold_preset_chosen, pattern=r"^hold_\d"),
-                CallbackQueryHandler(hold_custom_prompt, pattern="^hold_custom$"),
-            ],
-            ENTERING_CUSTOM_HOLD: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, custom_hold_entered)
-            ],
-        },
-        fallbacks=common_fallbacks + [CommandHandler("coins", coins_start)],
-        allow_reentry=True,
-    )
-
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(coins_conv)
-    app.add_handler(hold_conv)
+    app.add_handler(CommandHandler("coins", coins))
+    app.add_handler(CommandHandler("setentry", set_entry))
+    app.add_handler(CommandHandler("setinterval", set_interval))
     app.add_handler(CommandHandler("status", status))
-    app.add_handler(CommandHandler("stop", stop_command))
-    app.add_handler(CallbackQueryHandler(untrack_callback, pattern="^untrack_"))
-    app.add_handler(CallbackQueryHandler(stop_callback, pattern="^stop_"))
-    app.add_error_handler(error_handler)
+    app.add_handler(CommandHandler("portfolio", portfolio))
+    app.add_handler(CommandHandler("stop", stop))
+    app.add_handler(CallbackQueryHandler(on_coin_button))
 
     logger.info("Bot is running. Press Ctrl+C to stop.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
