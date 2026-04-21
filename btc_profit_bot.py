@@ -13,6 +13,7 @@ Commands:
 """
 
 import os
+import time
 import logging
 import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -28,23 +29,23 @@ from telegram.ext import (
 
 # ---------- Config ----------
 COINS = {
-    "BTC":  {"id": "bitcoin",           "name": "Bitcoin",   "emoji": "₿"},
-    "ETH":  {"id": "ethereum",          "name": "Ethereum",  "emoji": "Ξ"},
-    "SOL":  {"id": "solana",            "name": "Solana",    "emoji": "◎"},
-    "BNB":  {"id": "binancecoin",       "name": "BNB",       "emoji": "🟡"},
-    "XRP":  {"id": "ripple",            "name": "XRP",       "emoji": "💧"},
-    "DOGE": {"id": "dogecoin",          "name": "Dogecoin",  "emoji": "🐕"},
-    "ADA":  {"id": "cardano",           "name": "Cardano",   "emoji": "🔵"},
-    "AVAX": {"id": "avalanche-2",       "name": "Avalanche", "emoji": "🔺"},
-    "SHIB": {"id": "shiba-inu",         "name": "Shiba Inu", "emoji": "🐶"},
-    "PEPE": {"id": "pepe",             "name": "Pepe",      "emoji": "🐸"},
-    "WIF":  {"id": "dogwifhat",         "name": "dogwifhat", "emoji": "🎩"},
-    "BONK": {"id": "bonk",             "name": "Bonk",      "emoji": "🔨"},
-    "SUI":  {"id": "sui",              "name": "Sui",       "emoji": "💎"},
-    "TON":  {"id": "the-open-network", "name": "Toncoin",   "emoji": "💎"},
+    "BTC":  {"name": "Bitcoin",   "emoji": "₿",  "binance": "BTCUSDT"},
+    "ETH":  {"name": "Ethereum",  "emoji": "Ξ",  "binance": "ETHUSDT"},
+    "SOL":  {"name": "Solana",    "emoji": "◎",  "binance": "SOLUSDT"},
+    "BNB":  {"name": "BNB",       "emoji": "🟡", "binance": "BNBUSDT"},
+    "XRP":  {"name": "XRP",       "emoji": "💧", "binance": "XRPUSDT"},
+    "DOGE": {"name": "Dogecoin",  "emoji": "🐕", "binance": "DOGEUSDT"},
+    "ADA":  {"name": "Cardano",   "emoji": "🔵", "binance": "ADAUSDT"},
+    "AVAX": {"name": "Avalanche", "emoji": "🔺", "binance": "AVAXUSDT"},
+    "SHIB": {"name": "Shiba Inu", "emoji": "🐶", "binance": "SHIBUSDT"},
+    "PEPE": {"name": "Pepe",      "emoji": "🐸", "binance": "PEPEUSDT"},
+    "WIF":  {"name": "dogwifhat", "emoji": "🎩", "binance": "WIFUSDT"},
+    "BONK": {"name": "Bonk",      "emoji": "🔨", "binance": "BONKUSDT"},
+    "SUI":  {"name": "Sui",       "emoji": "💎", "binance": "SUIUSDT"},
+    "TON":  {"name": "Toncoin",   "emoji": "💎", "binance": "TONUSDT"},
 }
 DEFAULT_HOLD_USD = 10.0
-COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price"
+BINANCE_URL = "https://api.binance.com/api/v3/ticker/price"
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "PUT_YOUR_TOKEN_HERE")
 
 logging.basicConfig(
@@ -59,11 +60,19 @@ SETHOLD_MENU, ENTERING_CUSTOM_HOLD = range(3, 5)
 
 
 # ---------- Helpers ----------
-async def get_coin_price(coin_id: str) -> float:
+_price_cache: dict[str, tuple[float, float]] = {}  # symbol → (price, timestamp)
+
+
+async def get_coin_price(symbol: str) -> float:
+    cached = _price_cache.get(symbol)
+    if cached and time.time() - cached[1] < 60:
+        return cached[0]
     async with httpx.AsyncClient(timeout=10.0) as client:
-        r = await client.get(COINGECKO_URL, params={"ids": coin_id, "vs_currencies": "usd"})
+        r = await client.get(BINANCE_URL, params={"symbol": COINS[symbol]["binance"]})
         r.raise_for_status()
-        return float(r.json()[coin_id]["usd"])
+        price = float(r.json()["price"])
+    _price_cache[symbol] = (price, time.time())
+    return price
 
 
 def format_status(symbol: str, entry_price: float, current_price: float, hold_usd: float) -> str:
@@ -196,7 +205,7 @@ async def interval_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     hold_usd = context.chat_data.get("hold_usd", DEFAULT_HOLD_USD)
 
     positions = context.chat_data.setdefault("positions", {})
-    positions[symbol] = {"coin_id": coin["id"], "entry_price": entry_price, "interval": minutes}
+    positions[symbol] = {"entry_price": entry_price, "interval": minutes}
 
     cancel_coin_job(context, chat_id, symbol)
     context.job_queue.run_repeating(
@@ -275,7 +284,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     hold_usd = context.chat_data.get("hold_usd", DEFAULT_HOLD_USD)
     for symbol, pos in positions.items():
         try:
-            price = await get_coin_price(pos["coin_id"])
+            price = await get_coin_price(symbol)
         except Exception as e:
             await update.message.reply_text(f"⚠️ Could not fetch {symbol} price: {e}")
             continue
@@ -350,7 +359,7 @@ async def send_update(context: ContextTypes.DEFAULT_TYPE) -> None:
     entry_price = job.data["entry_price"]
     hold_usd = context.chat_data.get("hold_usd", DEFAULT_HOLD_USD)
     try:
-        price = await get_coin_price(COINS[symbol]["id"])
+        price = await get_coin_price(symbol)
     except Exception as e:
         logger.exception("Scheduled price fetch failed for %s", symbol)
         await context.bot.send_message(
@@ -364,12 +373,24 @@ async def send_update(context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+# ---------- Error handler ----------
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Unhandled exception", exc_info=context.error)
+
+
 # ---------- Main ----------
 def main() -> None:
     if BOT_TOKEN == "PUT_YOUR_TOKEN_HERE":
         raise SystemExit("❌ Set TELEGRAM_BOT_TOKEN env var or edit BOT_TOKEN in the code.")
 
     app = Application.builder().token(BOT_TOKEN).build()
+
+    common_fallbacks = [
+        CommandHandler("cancel", cancel_conv),
+        CommandHandler("start", start),
+        CommandHandler("status", status),
+        CommandHandler("stop", stop_command),
+    ]
 
     coins_conv = ConversationHandler(
         entry_points=[CommandHandler("coins", coins_start)],
@@ -378,7 +399,8 @@ def main() -> None:
             ENTERING_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, price_entered)],
             CHOOSING_INTERVAL: [CallbackQueryHandler(interval_chosen, pattern="^interval_")],
         },
-        fallbacks=[CommandHandler("cancel", cancel_conv)],
+        fallbacks=common_fallbacks + [CommandHandler("sethold", sethold_start)],
+        allow_reentry=True,
     )
 
     hold_conv = ConversationHandler(
@@ -392,7 +414,8 @@ def main() -> None:
                 MessageHandler(filters.TEXT & ~filters.COMMAND, custom_hold_entered)
             ],
         },
-        fallbacks=[CommandHandler("cancel", cancel_conv)],
+        fallbacks=common_fallbacks + [CommandHandler("coins", coins_start)],
+        allow_reentry=True,
     )
 
     app.add_handler(CommandHandler("start", start))
@@ -402,6 +425,7 @@ def main() -> None:
     app.add_handler(CommandHandler("stop", stop_command))
     app.add_handler(CallbackQueryHandler(untrack_callback, pattern="^untrack_"))
     app.add_handler(CallbackQueryHandler(stop_callback, pattern="^stop_"))
+    app.add_error_handler(error_handler)
 
     logger.info("Bot is running. Press Ctrl+C to stop.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
